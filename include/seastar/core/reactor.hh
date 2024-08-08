@@ -30,6 +30,7 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/idle_cpu_handler.hh>
+#include <seastar/core/internal/io_desc.hh>
 #include <seastar/core/internal/io_request.hh>
 #include <seastar/core/internal/io_sink.hh>
 #include <seastar/core/iostream.hh>
@@ -46,7 +47,6 @@
 #include <seastar/core/scheduling_specific.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread_cputime_clock.hh>
@@ -55,8 +55,9 @@
 #include <seastar/net/api.hh>
 #include <seastar/util/eclipse.hh>
 #include <seastar/util/log.hh>
-#include <seastar/util/std-compat.hh>
 #include <seastar/util/modules.hh>
+#include <seastar/util/noncopyable_function.hh>
+#include <seastar/util/std-compat.hh>
 #include "internal/pollable_fd.hh"
 
 #ifndef SEASTAR_MODULE
@@ -139,7 +140,6 @@ void increase_thrown_exceptions_counter() noexcept;
 
 }
 
-class kernel_completion;
 class io_queue;
 SEASTAR_MODULE_EXPORT
 class io_intent;
@@ -251,7 +251,6 @@ private:
     bool _stopped = false;
     bool _finished_running_tasks = false;
     condition_variable _stop_requested;
-    bool _handle_sigint = true;
     std::optional<future<std::unique_ptr<network_stack>>> _network_stack_ready;
     int _return = 0;
     promise<> _start_promise;
@@ -262,7 +261,6 @@ private:
     metrics::internal::time_estimated_histogram _stalls_histogram;
     std::unique_ptr<internal::cpu_stall_detector> _cpu_stall_detector;
 
-    unsigned _max_task_backlog = 1000;
     timer<>::set_t _timers;
     timer<>::set_t::timer_list_t _expired_timers;
     timer<lowres_clock>::set_t _lowres_timers;
@@ -307,7 +305,6 @@ private:
     task_queue_list _active_task_queues;
     task_queue_list _activating_task_queues;
     task_queue* _at_destroy_tasks;
-    sched_clock::duration _task_quota;
     task* _current_task = nullptr;
     /// Handler that will be called when there is no task to execute on cpu.
     /// It represents a low priority work.
@@ -327,15 +324,9 @@ private:
     sched_clock::duration _total_idle{0};
     sched_clock::duration _total_sleep;
     sched_clock::time_point _start_time = now();
-    std::chrono::nanoseconds _max_poll_time = calculate_poll_time();
     output_stream<char>::batch_flush_list_t _flush_batching;
     std::atomic<bool> _sleeping alignas(seastar::cache_line_size){0};
     pthread_t _thread_id alignas(seastar::cache_line_size) = pthread_self();
-    bool _strict_o_direct = true;
-    bool _force_io_getevents_syscall = false;
-    bool _bypass_fsync = false;
-    bool _have_aio_fsync = false;
-    bool _kernel_page_cache = false;
     std::atomic<bool> _dying{false};
     gate _background_gate;
 
@@ -367,6 +358,8 @@ public:
     void wakeup();
     /// @private
     bool stopped() const noexcept { return _stopped; }
+    /// @private
+    uint64_t polls() const noexcept { return _polls; }
 
 private:
     class signals {
@@ -437,6 +430,7 @@ private:
     future<temporary_buffer<char>>
     do_recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba);
 
+    void configure(const reactor_options& opts);
     int do_run();
 public:
     explicit reactor(std::shared_ptr<smp> smp, alien::instance& alien, unsigned id, reactor_backend_selector rbs, reactor_config cfg);
@@ -477,8 +471,6 @@ public:
     void rename_queues(internal::priority_class pc, sstring new_name);
     /// @private
     void update_shares_for_queues(internal::priority_class pc, uint32_t shares);
-
-    void configure(const reactor_options& opts);
 
     server_socket listen(socket_address sa, listen_options opts = {});
 

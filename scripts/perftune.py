@@ -21,6 +21,8 @@ import urllib.request
 import yaml
 import platform
 import shlex
+import psutil
+import mmap
 
 dry_run_mode = False
 def perftune_print(log_msg, *args, **kwargs):
@@ -575,10 +577,11 @@ class NetPerfTuner(PerfTunerBase):
 
         self.nics=args.nics
 
-        self.__nic_is_bond_iface = self.__check_dev_is_bond_iface()
+        self.__nic_is_bond_iface = NetPerfTuner.__get_bond_ifaces()
+        self.__nic_is_vlan_iface = NetPerfTuner.__get_vlan_ifaces()
         self.__slaves = self.__learn_slaves()
 
-        # check that self.nics contain a HW device or a bonding interface
+        # check that self.nics contain a HW device or a supported composite interface
         self.__check_nics()
 
         # Fetch IRQs related info
@@ -595,8 +598,8 @@ class NetPerfTuner(PerfTunerBase):
                 perftune_print("Setting a physical interface {}...".format(nic))
                 self.__setup_one_hw_iface(nic)
             else:
-                perftune_print("Setting {} bonding interface...".format(nic))
-                self.__setup_bonding_iface(nic)
+                perftune_print(f"Setting a {nic} {'bond' if self.nic_is_bond_iface(nic) else 'VLAN'} interface...")
+                self.__setup_composite_iface(nic)
 
         # Increase the socket listen() backlog
         fwriteln_and_log('/proc/sys/net/core/somaxconn', '4096')
@@ -605,8 +608,25 @@ class NetPerfTuner(PerfTunerBase):
         # did not receive an acknowledgment from connecting client.
         fwriteln_and_log('/proc/sys/net/ipv4/tcp_max_syn_backlog', '4096')
 
+        self.tune_tcp_mem()
+
+    def tune_tcp_mem(self):
+        page_size = mmap.PAGESIZE
+        total_mem = psutil.virtual_memory().total
+        # We only tune for physical memory since tcp_mem is virtualized
+        def to_pages(bytes):
+            return math.ceil(bytes / page_size)
+        max = total_mem * self.args.tcp_mem_fraction
+        fwriteln_and_log('/proc/sys/net/ipv4/tcp_mem', f"{to_pages(max / 2)} {to_pages(max * 2/3)} {to_pages(max)}")
+
     def nic_is_bond_iface(self, nic):
-        return self.__nic_is_bond_iface[nic]
+        return self.__nic_is_bond_iface.get(nic, False)
+
+    def nic_is_vlan_iface(self, nic):
+        return self.__nic_is_vlan_iface.get(nic, False)
+
+    def nic_is_composite_iface(self, nic):
+        return self.nic_is_bond_iface(nic) or self.nic_is_vlan_iface(nic)
 
     def nic_exists(self, nic):
         return self.__iface_exists(nic)
@@ -617,8 +637,8 @@ class NetPerfTuner(PerfTunerBase):
     def slaves(self, nic):
         """
         Returns an iterator for all slaves of the nic.
-        If agrs.nic is not a bonding interface an attempt to use the returned iterator
-        will immediately raise a StopIteration exception - use __dev_is_bond_iface() check to avoid this.
+        If agrs.nic is not a composite interface an attempt to use the returned iterator
+        will immediately raise a StopIteration exception - use nic_is_composite_iface() check to avoid this.
         """
         return iter(self.__slaves[nic])
 
@@ -646,7 +666,7 @@ class NetPerfTuner(PerfTunerBase):
         for nic in self.nics:
             if not self.nic_exists(nic):
                 raise Exception("Device {} does not exist".format(nic))
-            if not self.nic_is_hw_iface(nic) and not self.nic_is_bond_iface(nic):
+            if not self.nic_is_hw_iface(nic) and not self.nic_is_composite_iface(nic):
                 raise Exception("Not supported virtual device {}".format(nic))
 
     def __get_irqs_one(self, iface):
@@ -732,22 +752,68 @@ class NetPerfTuner(PerfTunerBase):
     def __dev_is_hw_iface(self, iface):
         return os.path.exists("/sys/class/net/{}/device".format(iface))
 
-    def __check_dev_is_bond_iface(self):
-        bond_dict = {}
+    @staticmethod
+    def __get_bond_ifaces():
         if not os.path.exists('/sys/class/net/bonding_masters'):
-            for nic in self.nics:
-                bond_dict[nic] = False
-            #return False for every nic
-            return bond_dict
-        for nic in self.nics:
-            bond_dict[nic] = any([re.search(nic, line) for line in open('/sys/class/net/bonding_masters', 'r').readlines()])
+            return {}
+
+        bond_dict = {}
+        for line in open('/sys/class/net/bonding_masters', 'r').readlines():
+            for nic in line.split():
+                bond_dict[nic] = True
+
         return bond_dict
 
+    @staticmethod
+    def __get_vlan_ifaces():
+        # Each VLAN interface is going to have a corresponding entry in /proc/net/vlan/ directory
+        return {pathlib.PurePath(pathlib.Path(f)).name: True
+                for f in filter(lambda vlan_name: vlan_name != "/proc/net/vlan/config", glob.glob("/proc/net/vlan/*"))}
+
+    def __learn_slaves_one(self, nic):
+        """
+        Learn underlying physical devices a given NIC
+
+        :param nic: An interface to search slaves for
+        """
+        slaves_list = set()
+        top_slaves_list = set()
+
+        if self.nic_is_bond_iface(nic):
+            top_slaves_list = set(itertools.chain.from_iterable(
+                [line.split() for line in open("/sys/class/net/{}/bonding/slaves".format(nic), 'r').readlines()]))
+        elif self.nic_is_vlan_iface(nic):
+            # VLAN interfaces have a symbolic link 'lower_<parent_interface_name>' under
+            # /sys/class/net/<VLAN interface name>.
+            #
+            # For example:
+            #
+            # lrwxrwxrwx  1 root root    0 Jul  5 18:38 lower_eno1 -> ../../../pci0000:00/0000:00:1f.6/net/eno1/
+            #
+            top_slaves_list = set([pathlib.PurePath(pathlib.Path(f).resolve()).name
+                                   for f in glob.glob(f"/sys/class/net/{nic}/lower_*")])
+
+        # Slaves can be themselves bond or VLAN devices: let's descend (DFS) all the way down to get physical devices.
+        # Bond slaves can't be VLAN interfaces but VLAN interface parent device can be a bond interface.
+        # Bond slaves can also be bonds.
+        # For simplicity let's not discriminate.
+        for s in top_slaves_list:
+            if self.nic_is_composite_iface(s):
+                slaves_list |= self.__learn_slaves_one(s)
+            else:
+                slaves_list.add(s)
+
+        return slaves_list
+
     def __learn_slaves(self):
+        """
+        Resolve underlying physical devices for interfaces we are requested to configure
+        """
         slaves_list_per_nic = {}
         for nic in self.nics:
-            if self.nic_is_bond_iface(nic):
-                slaves_list_per_nic[nic] = list(itertools.chain.from_iterable([line.split() for line in open("/sys/class/net/{}/bonding/slaves".format(nic), 'r').readlines()]))
+            current_slaves = self.__learn_slaves_one(nic)
+            if current_slaves:
+                slaves_list_per_nic[nic] = list(current_slaves)
 
         return slaves_list_per_nic
 
@@ -767,8 +833,8 @@ class NetPerfTuner(PerfTunerBase):
         :param irq: IRQ number
         :return: HW queue index for Intel NICs and sys.maxsize for all other NICs
         """
-        intel_fp_irq_re = re.compile("\-TxRx\-(\d+)")
-        fdir_re = re.compile("fdir\-TxRx\-\d+")
+        intel_fp_irq_re = re.compile(r"-TxRx-(\d+)")
+        fdir_re = re.compile(r"fdir-TxRx-\d+")
 
         m = intel_fp_irq_re.search(self.__irqs2procline[irq])
         m1 = fdir_re.search(self.__irqs2procline[irq])
@@ -792,8 +858,8 @@ class NetPerfTuner(PerfTunerBase):
         :param irq: IRQ number
         :return: HW queue index for Mellanox NICs and sys.maxsize for all other NICs
         """
-        mlx5_fp_irq_re = re.compile("mlx5_comp(\d+)")
-        mlx4_fp_irq_re = re.compile("mlx4\-(\d+)")
+        mlx5_fp_irq_re = re.compile(r"mlx5_comp(\d+)")
+        mlx4_fp_irq_re = re.compile(r"mlx4-(\d+)")
 
         m5 = mlx5_fp_irq_re.search(self.__irqs2procline[irq])
         if m5:
@@ -878,7 +944,7 @@ class NetPerfTuner(PerfTunerBase):
         """
         # filter 'all_irqs' to only reference valid keys from 'irqs2procline' and avoid an IndexError on the 'irqs' search below
         all_irqs = set(learn_all_irqs_one("/sys/class/net/{}/device".format(iface), self.__irqs2procline, iface)).intersection(self.__irqs2procline.keys())
-        fp_irqs_re = re.compile("\-TxRx\-|\-fp\-|\-Tx\-Rx\-|mlx4-\d+@|mlx5_comp\d+@|virtio\d+-(input|output)")
+        fp_irqs_re = re.compile(r"-TxRx-|-fp-|-Tx-Rx-|mlx4-\d+@|mlx5_comp\d+@|virtio\d+-(input|output)")
         irqs = sorted(list(filter(lambda irq : fp_irqs_re.search(self.__irqs2procline[irq]), all_irqs)))
         if irqs:
             irqs.sort(key=self.__get_irq_to_queue_idx_functor(iface))
@@ -946,7 +1012,7 @@ class NetPerfTuner(PerfTunerBase):
         """
         nic_irq_dict={}
         for nic in self.nics:
-            if self.nic_is_bond_iface(nic):
+            if self.nic_is_composite_iface(nic):
                 for slave in filter(self.__dev_is_hw_iface, self.slaves(nic)):
                     nic_irq_dict[slave] = self.__learn_irqs_one(slave)
             else:
@@ -1038,7 +1104,11 @@ class NetPerfTuner(PerfTunerBase):
         self.__setup_rps(iface, self.cpu_mask)
         self.__setup_xps(iface)
 
-    def __setup_bonding_iface(self, nic):
+    def __setup_composite_iface(self, nic):
+        """
+        Set up the interface which is a bond or a VLAN interface
+        :param nic: name of a composite interface to set up
+        """
         for slave in self.slaves(nic):
             if self.__dev_is_hw_iface(slave):
                 perftune_print("Setting up {}...".format(slave))
@@ -1100,8 +1170,10 @@ class ClocksourceManager:
     def _get_arch(self):
         try:
             virt = run_read_only_command(['systemd-detect-virt']).strip()
-            if virt == "kvm":
-                return virt
+            # According to https://www.freedesktop.org/software/systemd/man/latest/systemd-detect-virt.html
+            # 'amazon' and 'google' are returned for KVM guests.
+            if virt in ["kvm", "amazon", "google"]:
+                return "kvm"
         except:
             pass
         return platform.machine()
@@ -1388,7 +1460,7 @@ class DiskPerfTuner(PerfTunerBase):
                 #      /sys/devices/pci0000:00/0000:00:02.0/0000:02:00.0/host6/target6:2:0/6:2:0:0/block/sda/sda1
                 # We want only the path till the last BDF including - it contains the IRQs information.
 
-                patt = re.compile("^[0-9ABCDEFabcdef]{4}\:[0-9ABCDEFabcdef]{2}\:[0-9ABCDEFabcdef]{2}\.[0-9ABCDEFabcdef]$")
+                patt = re.compile(r"^[0-9ABCDEFabcdef]{4}:[0-9ABCDEFabcdef]{2}:[0-9ABCDEFabcdef]{2}\.[0-9ABCDEFabcdef]$")
                 for split_sys_path_branch in split_sys_path[4:]:
                     if patt.search(split_sys_path_branch):
                         controller_path_parts.append(split_sys_path_branch)
@@ -1508,6 +1580,10 @@ class TuneModes(enum.Enum):
     def names():
         return list(TuneModes.__members__.keys())
 
+# Seastar defaults to allocating 93% of physical memory. The kernel's default allocation for TCP is ~9%. This adds up
+# to 102%. Reduce the TCP allocation to 3% to avoid OOM.
+default_tcp_mem_fraction = 0.03
+
 argp = argparse.ArgumentParser(description = 'Configure various system parameters in order to improve the seastar application performance.', formatter_class=argparse.RawDescriptionHelpFormatter,
                                epilog=
 '''
@@ -1570,6 +1646,7 @@ argp.add_argument('--irq-core-auto-detection-ratio', help="Use a given ratio for
                                                           "CPU cores out of available according to a 'cpu_mask' value."
                                                           "Default is 16",
                   type=int, default=16, dest='cores_per_irq_core')
+argp.add_argument('--tcp-mem-fraction', default=default_tcp_mem_fraction, type=float, help="Fraction of total memory to allocate for TCP buffers")
 
 def parse_cpu_mask_from_yaml(y, field_name, fname):
     hex_32bit_pattern='0x[0-9a-fA-F]{1,8}'

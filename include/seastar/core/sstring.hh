@@ -38,6 +38,9 @@
 #include <functional>
 #include <type_traits>
 #include <fmt/format.h>
+#if FMT_VERSION >= 110000
+#include <fmt/ranges.h>
+#endif
 #endif
 #include <seastar/util/std-compat.hh>
 #include <seastar/util/modules.hh>
@@ -716,7 +719,7 @@ string_type uninitialized_string(size_t size) {
     } else {
         string_type ret;
 #ifdef __cpp_lib_string_resize_and_overwrite
-        ret.resize_and_overwrite(size, [](string_type::value_type*, string_type::size_type n) { return n; });
+        ret.resize_and_overwrite(size, [](typename string_type::value_type*, typename string_type::size_type n) { return n; });
 #else
         ret.resize(size);
 #endif
@@ -877,6 +880,14 @@ std::ostream& operator<<(std::ostream& os, const std::unordered_map<Key, T, Hash
     return os;
 }
 }
+
+#endif
+
+#if FMT_VERSION >= 110000
+
+template <typename char_type, typename Size, Size max_size, bool NulTerminate>
+struct fmt::range_format_kind<seastar::basic_sstring<char_type, Size, max_size, NulTerminate>, char_type> : std::integral_constant<fmt::range_format, fmt::range_format::disabled>
+{};
 
 #endif
 

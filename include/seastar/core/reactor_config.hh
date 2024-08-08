@@ -24,13 +24,24 @@
 #include <seastar/util/program-options.hh>
 #include <seastar/util/memory_diagnostics.hh>
 #include <seastar/util/modules.hh>
+#include <seastar/core/scheduling.hh>
 
 namespace seastar {
 
 /// \cond internal
 struct reactor_config {
+    sched_clock::duration task_quota;
+    std::chrono::nanoseconds max_poll_time;
+    bool handle_sigint = true;
     bool auto_handle_sigint_sigterm = true;
     unsigned max_networking_aio_io_control_blocks = 10000;
+    bool force_io_getevents_syscall = false;
+    bool kernel_page_cache = false;
+    bool have_aio_fsync = false;
+    unsigned max_task_backlog = 1000;
+    bool strict_o_direct = true;
+    bool bypass_fsync = false;
+    bool no_poll_aio = false;
 };
 /// \endcond
 
@@ -74,6 +85,11 @@ struct reactor_options : public program_options::option_group {
     ///
     /// Default: 1.1
     program_options::value<double> io_flow_ratio_threshold;
+    /// \brief If an IO request is executed longer than that, this is printed to
+    /// logs with extra debugging
+    ///
+    /// Default: infinite (detection is OFF)
+    program_options::value<unsigned> io_completion_notify_ms;
     /// \brief Maximum number of task backlog to allow.
     ///
     /// When the number of tasks grow above this, we stop polling (e.g. I/O)

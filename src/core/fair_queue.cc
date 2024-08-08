@@ -25,14 +25,9 @@ module;
 
 #include <chrono>
 #include <functional>
-#include <queue>
-#include <unordered_set>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 #include <boost/intrusive/parent_from_member.hpp>
-
-#include "fmt/format.h"
-#include "fmt/ostream.h"
 
 #ifdef SEASTAR_MODULE
 module seastar;
@@ -42,7 +37,6 @@ module seastar;
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/util/noncopyable_function.hh>
-#include <seastar/core/reactor.hh>
 #include <seastar/core/metrics.hh>
 #endif
 
