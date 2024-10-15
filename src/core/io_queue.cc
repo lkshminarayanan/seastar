@@ -23,8 +23,6 @@
 module;
 #endif
 
-#include <compare>
-#include <atomic>
 #include <cassert>
 #include <array>
 #include <chrono>
@@ -220,6 +218,7 @@ class io_desc_read_write final : public io_completion {
     const fair_queue_entry::capacity_t _fq_capacity;
     promise<size_t> _pr;
     iovec_keeper _iovs;
+    uint64_t _dispatched_polls;
 
 public:
     io_desc_read_write(io_queue& ioq, io_queue::priority_class_data& pc, stream_id stream, io_direction_and_length dnl, fair_queue_entry::capacity_t cap, iovec_keeper iovs)
@@ -237,7 +236,7 @@ public:
     virtual void set_exception(std::exception_ptr eptr) noexcept override {
         io_log.trace("dev {} : req {} error", _ioq.dev_id(), fmt::ptr(this));
         _pclass.on_error();
-        _ioq.complete_request(*this);
+        _ioq.complete_request(*this, std::chrono::duration<double>(0.0));
         _pr.set_exception(eptr);
         delete this;
     }
@@ -245,8 +244,9 @@ public:
     virtual void complete(size_t res) noexcept override {
         io_log.trace("dev {} : req {} complete", _ioq.dev_id(), fmt::ptr(this));
         auto now = io_queue::clock_type::now();
-        _pclass.on_complete(std::chrono::duration_cast<std::chrono::duration<double>>(now - _ts));
-        _ioq.complete_request(*this);
+        auto delay = std::chrono::duration_cast<std::chrono::duration<double>>(now - _ts);
+        _pclass.on_complete(delay);
+        _ioq.complete_request(*this, delay);
         _pr.set_value(res);
         delete this;
     }
@@ -262,6 +262,7 @@ public:
         auto now = io_queue::clock_type::now();
         _pclass.on_dispatch(_dnl, std::chrono::duration_cast<std::chrono::duration<double>>(now - _ts));
         _ts = now;
+        _dispatched_polls = engine().polls();
     }
 
     future<size_t> get_future() {
@@ -270,6 +271,7 @@ public:
 
     fair_queue_entry::capacity_t capacity() const noexcept { return _fq_capacity; }
     stream_id stream() const noexcept { return _stream; }
+    uint64_t polls() const noexcept { return _dispatched_polls; }
 };
 
 class queued_io_request : private internal::io_request {
@@ -330,21 +332,11 @@ public:
 
 namespace internal {
 
-#if SEASTAR_API_LEVEL < 7
-priority_class::priority_class(const io_priority_class& pc) noexcept : _id(pc.id())
-{ }
-#endif
-
 priority_class::priority_class(const scheduling_group& sg) noexcept : _id(internal::scheduling_group_index(sg))
 { }
 
-#if SEASTAR_API_LEVEL >= 7
 priority_class::priority_class(internal::maybe_priority_class_ref pc) noexcept : priority_class(current_scheduling_group())
 { }
-#else
-priority_class::priority_class(internal::maybe_priority_class_ref pc) noexcept : priority_class(pc.pc)
-{ }
-#endif
 
 cancellable_queue::cancellable_queue(cancellable_queue&& o) noexcept
         : _first(std::exchange(o._first, nullptr))
@@ -417,14 +409,15 @@ void io_sink::submit(io_completion* desc, io_request req) noexcept {
 }
 
 std::vector<io_request::part> io_request::split(size_t max_length) {
-    if (_op == operation::read || _op == operation::write) {
+    auto op = opcode();
+    if (op == operation::read || op == operation::write) {
         return split_buffer(max_length);
     }
-    if (_op == operation::readv || _op == operation::writev) {
+    if (op == operation::readv || op == operation::writev) {
         return split_iovec(max_length);
     }
 
-    seastar_logger.error("Invalid operation for split: {}", static_cast<int>(_op));
+    seastar_logger.error("Invalid operation for split: {}", static_cast<int>(op));
     std::abort();
 }
 
@@ -494,7 +487,7 @@ std::vector<io_request::part> io_request::split_iovec(size_t max_length) {
 }
 
 sstring io_request::opname() const {
-    switch (_op) {
+    switch (opcode()) {
     case io_request::operation::fdatasync:
         return "fdatasync";
     case io_request::operation::write:
@@ -547,11 +540,23 @@ void io_queue::update_flow_ratio() noexcept {
     }
 }
 
+void io_queue::lower_stall_threshold() noexcept {
+    auto new_threshold = _stall_threshold - std::chrono::milliseconds(1);
+    _stall_threshold = std::max(_stall_threshold_min, new_threshold);
+}
+
 void
-io_queue::complete_request(io_desc_read_write& desc) noexcept {
+io_queue::complete_request(io_desc_read_write& desc, std::chrono::duration<double> delay) noexcept {
     _requests_executing--;
     _requests_completed++;
     _streams[desc.stream()].notify_request_finished(desc.capacity());
+
+    if (delay > _stall_threshold) {
+        _stall_threshold *= 2;
+        io_log.warn("Request took {:.3f}ms ({} polls) to execute, queued {} executing {}",
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(delay).count(),
+            engine().polls() - desc.polls(), _queued_requests, _requests_executing);
+    }
 }
 
 fair_queue::config io_queue::make_fair_queue_config(const config& iocfg, sstring label) {
@@ -564,7 +569,12 @@ io_queue::io_queue(io_group_ptr group, internal::io_sink& sink)
     : _priority_classes()
     , _group(std::move(group))
     , _sink(sink)
-    , _flow_ratio_update([this] { update_flow_ratio(); })
+    , _averaging_decay_timer([this] {
+        update_flow_ratio();
+        lower_stall_threshold();
+    })
+    , _stall_threshold_min(std::max(get_config().stall_threshold, 1ms))
+    , _stall_threshold(_stall_threshold_min)
 {
     auto& cfg = get_config();
     if (cfg.duplex) {
@@ -575,7 +585,7 @@ io_queue::io_queue(io_group_ptr group, internal::io_sink& sink)
     } else {
         _streams.emplace_back(_group->_fgs[0], make_fair_queue_config(cfg, "rw"));
     }
-    _flow_ratio_update.arm_periodic(std::chrono::duration_cast<std::chrono::milliseconds>(_group->io_latency_goal() * cfg.flow_ratio_ticks));
+    _averaging_decay_timer.arm_periodic(std::chrono::duration_cast<std::chrono::milliseconds>(_group->io_latency_goal() * cfg.averaging_decay_ticks));
 
     namespace sm = seastar::metrics;
     auto owner_l = sm::shard_label(this_shard_id());
@@ -667,102 +677,10 @@ io_queue::~io_queue() {
     }
 }
 
-#if SEASTAR_API_LEVEL >= 7
 std::tuple<unsigned, sstring> get_class_info(io_priority_class_id pc) {
     auto sg = internal::scheduling_group_from_index(pc);
     return std::make_tuple(sg.get_shares(), sg.name());
 }
-#else
-
-std::mutex io_priority_class::_register_lock;
-std::array<io_priority_class::class_info, io_priority_class::_max_classes> io_priority_class::_infos;
-
-unsigned io_priority_class::get_shares() const {
-    return _infos.at(_id).shares;
-}
-
-sstring io_priority_class::get_name() const {
-    std::lock_guard<std::mutex> lock(_register_lock);
-    return _infos.at(_id).name;
-}
-
-io_priority_class io_priority_class::register_one(sstring name, uint32_t shares) {
-    std::lock_guard<std::mutex> lock(_register_lock);
-    for (unsigned i = 0; i < _max_classes; ++i) {
-        if (!_infos[i].registered()) {
-            _infos[i].shares = shares;
-            _infos[i].name = std::move(name);
-        } else if (_infos[i].name != name) {
-            continue;
-        } else {
-            // found an entry matching the name to be registered,
-            // make sure it was registered with the same number shares
-            // Note: those may change dynamically later on in the
-            // fair queue
-            assert(_infos[i].shares == shares);
-        }
-        return io_priority_class(i);
-    }
-    throw std::runtime_error("No more room for new I/O priority classes");
-}
-
-future<> io_priority_class::update_shares(uint32_t shares) const {
-    // Keep registered shares intact, just update the ones
-    // on reactor queues
-    return futurize_invoke([this, shares] {
-        engine().update_shares_for_queues(internal::priority_class(*this), shares);
-    });
-}
-
-future<> io_priority_class::update_bandwidth(uint64_t bandwidth) const {
-    return engine().update_bandwidth_for_queues(internal::priority_class(*this), bandwidth);
-}
-
-bool io_priority_class::rename_registered(sstring new_name) {
-    std::lock_guard<std::mutex> guard(_register_lock);
-    for (unsigned i = 0; i < _max_classes; ++i) {
-       if (!_infos[i].registered()) {
-           break;
-       }
-       if (_infos[i].name == new_name) {
-           if (i == id()) {
-               return false;
-           } else {
-               io_log.error("trying to rename priority class with id {} to \"{}\" but that name already exists", id(), new_name);
-               throw std::runtime_error(format("rename priority class: an attempt was made to rename a priority class to an"
-                       " already existing name ({})", new_name));
-           }
-       }
-    }
-    _infos[id()].name = new_name;
-    return true;
-}
-
-future<> io_priority_class::rename(sstring new_name) noexcept {
-    return futurize_invoke([this, new_name = std::move(new_name)] () mutable {
-        // Taking the lock here will prevent from newly registered classes
-        // to register under the old name (and will prevent undefined
-        // behavior since this array is shared cross shards. However, it
-        // doesn't prevent the case where a newly registered class (that
-        // got registered right after the lock release) will be unnecessarily
-        // renamed. This is not a real problem and it is a lot better than
-        // holding the lock until all cross shard activity is over.
-
-        if (!rename_registered(new_name)) {
-            return make_ready_future<>();
-        }
-
-        return smp::invoke_on_all([this, new_name = std::move(new_name)] {
-            engine().rename_queues(internal::priority_class(*this), new_name);
-        });
-    });
-}
-
-std::tuple<unsigned, sstring> get_class_info(io_priority_class_id pc) {
-    const auto& ci = io_priority_class::_infos.at(pc);
-    return std::make_tuple(ci.shares, ci.name);
-}
-#endif
 
 std::vector<seastar::metrics::impl::metric_definition_impl> io_queue::priority_class_data::metrics() {
     namespace sm = seastar::metrics;

@@ -22,12 +22,16 @@
 
 #ifdef SEASTAR_MODULE
 module;
+#endif
+
 #include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <array>
 #include <pthread.h>
 #include <signal.h>
+
+#ifdef SEASTAR_MODULE
 module seastar;
 #else
 #include <seastar/core/reactor.hh>
@@ -36,8 +40,6 @@ module seastar;
 
 namespace seastar {
 
-/* not yet implemented for OSv. TODO: do the notification like we do class smp. */
-#ifndef HAVE_OSV
 thread_pool::thread_pool(reactor& r, sstring name) : _reactor(r), _worker_thread([this, name] { work(name); }) {
 }
 
@@ -68,7 +70,8 @@ void thread_pool::work(sstring name) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
             if (_main_thread_idle.load(std::memory_order_relaxed)) {
                 uint64_t one = 1;
-                ::write(_reactor._notify_eventfd.get(), &one, 8);
+                auto res = ::write(_reactor._notify_eventfd.get(), &one, 8);
+                assert(res == 8 && "write(2) failed on _reactor._notify_eventfd");
             }
         }
     }
@@ -79,6 +82,5 @@ thread_pool::~thread_pool() {
     inter_thread_wq._start_eventfd.signal(1);
     _worker_thread.join();
 }
-#endif
 
 }

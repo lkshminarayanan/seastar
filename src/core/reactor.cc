@@ -23,18 +23,19 @@
 module;
 #endif
 
-#include <compare>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <coroutine> 
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <ranges>
 #include <regex>
 #include <thread>
 
-#include <cinttypes>
+#include <grp.h>
 #include <spawn.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
@@ -62,7 +63,6 @@ module;
 #include <boost/intrusive/list.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/adaptor/map.hpp>
-#include <boost/range/irange.hpp>
 #include <boost/range/numeric.hpp>
 #include <boost/range/algorithm/sort.hpp>
 #include <boost/range/algorithm/remove_if.hpp>
@@ -99,10 +99,6 @@ module;
 #include <sys/sdt.h>
 #else
 #define STAP_PROBE(provider, name)
-#endif
-
-#ifdef HAVE_OSV
-#include <osv/newpoll.hh>
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -145,7 +141,9 @@ module seastar;
 #include <seastar/core/resource.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/scheduling_specific.hh>
+#include <seastar/core/signal.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/smp_options.hh>
 #include <seastar/core/stall_sampler.hh>
 #include <seastar/core/systemwide_memory_barrier.hh>
@@ -168,6 +166,7 @@ module seastar;
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/memory_diagnostics.hh>
+#include <seastar/util/noncopyable_function.hh>
 #include <seastar/util/print_safe.hh>
 #include <seastar/util/process.hh>
 #include <seastar/util/read_first_line.hh>
@@ -240,26 +239,6 @@ shard_id reactor::cpu_id() const {
     assert(_id == this_shard_id());
     return _id;
 }
-
-#if SEASTAR_API_LEVEL < 7
-io_priority_class
-reactor::register_one_priority_class(sstring name, uint32_t shares) {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    return io_priority_class::register_one(std::move(name), shares);
-#pragma GCC diagnostic pop
-}
-
-future<>
-reactor::update_shares_for_class(io_priority_class pc, uint32_t shares) {
-    return pc.update_shares(shares);
-}
-
-future<>
-reactor::rename_priority_class(io_priority_class pc, sstring new_name) noexcept {
-    return pc.rename(std::move(new_name));
-}
-#endif
 
 void reactor::update_shares_for_queues(internal::priority_class pc, uint32_t shares) {
     for (auto&& q : _io_queues) {
@@ -1019,9 +998,9 @@ reactor::task_queue::set_shares(float shares) noexcept {
 
 void
 reactor::account_runtime(task_queue& tq, sched_clock::duration runtime) {
-    if (runtime > (2 * _task_quota)) {
+    if (runtime > (2 * _cfg.task_quota)) {
         _stalls_histogram.add(runtime);
-        tq._time_spent_on_task_quota_violations += runtime - _task_quota;
+        tq._time_spent_on_task_quota_violations += runtime - _cfg.task_quota;
     }
     tq._vruntime += tq.to_vruntime(runtime);
     tq._runtime += runtime;
@@ -1041,15 +1020,10 @@ struct reactor::task_queue::indirect_compare {
 reactor::reactor(std::shared_ptr<smp> smp, alien::instance& alien, unsigned id, reactor_backend_selector rbs, reactor_config cfg)
     : _smp(std::move(smp))
     , _alien(alien)
-    , _cfg(cfg)
+    , _cfg(std::move(cfg))
     , _notify_eventfd(file_desc::eventfd(0, EFD_CLOEXEC))
     , _task_quota_timer(file_desc::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC))
     , _id(id)
-#ifdef HAVE_OSV
-    , _timer_thread(
-        [&] { timer_thread_func(); }, sched::thread::attr().stack(4096).name("timer_thread").pin(sched::cpu::current()))
-    , _engine_thread(sched::thread::current())
-#endif
     , _cpu_started(0)
     , _cpu_stall_detector(internal::make_cpu_stall_detector())
     , _reuseport(posix_reuseport_detect())
@@ -1068,15 +1042,11 @@ reactor::reactor(std::shared_ptr<smp> smp, alien::instance& alien, unsigned id, 
     seastar::thread_impl::init();
     _backend->start_tick();
 
-#ifdef HAVE_OSV
-    _timer_thread.start();
-#else
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, internal::cpu_stall_detector::signal_number());
     auto r = ::pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
     assert(r == 0);
-#endif
     memory::set_reclaim_hook([this] (std::function<void ()> reclaim_fn) {
         add_high_priority_task(make_task(default_scheduling_group(), [fn = std::move(reclaim_fn)] {
             fn();
@@ -1108,7 +1078,7 @@ reactor::~reactor() {
             // The following line will preserve the convention that constructor and destructor functions
             // for the per sg values are called in the context of the containing scheduling group.
             *internal::current_scheduling_group_ptr() = scheduling_group(tq->_id);
-            for (size_t key : boost::irange<size_t>(0, sg_data.scheduling_group_key_configs.size())) {
+            for (size_t key : std::views::iota(0u, sg_data.scheduling_group_key_configs.size())) {
                 void* val = this_sg.specific_vals[key];
                 if (val) {
                     if (sg_data.scheduling_group_key_configs[key].destructor) {
@@ -1146,11 +1116,11 @@ future<> reactor::poll_rdhup(pollable_fd_state& fd) {
 }
 
 void reactor::set_strict_dma(bool value) {
-    _strict_o_direct = value;
+    _cfg.strict_o_direct = value;
 }
 
 void reactor::set_bypass_fsync(bool value) {
-    _bypass_fsync = value;
+    _cfg.bypass_fsync = value;
 }
 
 void
@@ -1524,41 +1494,6 @@ reactor::block_notifier(int) {
     engine()._cpu_stall_detector->on_signal();
 }
 
-#ifdef HAVE_OSV
-void reactor::timer_thread_func() {
-    sched::timer tmr(*sched::thread::current());
-    WITH_LOCK(_timer_mutex) {
-        while (!_stopped) {
-            if (_timer_due != 0) {
-                set_timer(tmr, _timer_due);
-                _timer_cond.wait(_timer_mutex, &tmr);
-                if (tmr.expired()) {
-                    _timer_due = 0;
-                    _engine_thread->unsafe_stop();
-                    _pending_tasks.push_front(make_task(default_scheduling_group(), [this] {
-                        _timers.complete(_expired_timers, [this] {
-                            if (!_timers.empty()) {
-                                enable_timer(_timers.get_next_timeout());
-                            }
-                        });
-                    }));
-                    _engine_thread->wake();
-                } else {
-                    tmr.cancel();
-                }
-            } else {
-                _timer_cond.wait(_timer_mutex);
-            }
-        }
-    }
-}
-
-void reactor::set_timer(sched::timer &tmr, s64 t) {
-    using namespace osv::clock;
-    tmr.set(wall::time_point(std::chrono::nanoseconds(t)));
-}
-#endif
-
 class network_stack_factory {
     network_stack_entry::factory_func _func;
 
@@ -1571,10 +1506,6 @@ public:
 void reactor::configure(const reactor_options& opts) {
     _network_stack_ready = opts.network_stack.get_selected_candidate()(*opts.network_stack.get_selected_candidate_opts());
 
-    _handle_sigint = !opts.no_handle_interrupt;
-    auto task_quota = opts.task_quota_ms.get_value() * 1ms;
-    _task_quota = std::chrono::duration_cast<sched_clock::duration>(task_quota);
-
     auto blocked_time = opts.blocked_reactor_notify_ms.get_value() * 1ms;
     internal::cpu_stall_detector_config csdc;
     csdc.threshold = blocked_time;
@@ -1582,23 +1513,9 @@ void reactor::configure(const reactor_options& opts) {
     csdc.oneline = opts.blocked_reactor_report_format_oneline.get_value();
     _cpu_stall_detector->update_config(csdc);
 
-    _max_task_backlog = opts.max_task_backlog.get_value();
-    _max_poll_time = opts.idle_poll_time_us.get_value() * 1us;
-    if (opts.poll_mode) {
-        _max_poll_time = std::chrono::nanoseconds::max();
-    }
-    if (opts.overprovisioned && opts.idle_poll_time_us.defaulted() && !opts.poll_mode) {
-        _max_poll_time = 0us;
-    }
-    set_strict_dma(!opts.relaxed_dma);
-    if (!opts.poll_aio.get_value() || (opts.poll_aio.defaulted() && opts.overprovisioned)) {
+    if (_cfg.no_poll_aio) {
         _aio_eventfd = pollable_fd(file_desc::eventfd(0, 0));
     }
-    set_bypass_fsync(opts.unsafe_bypass_fsync.get_value());
-    _kernel_page_cache = opts.kernel_page_cache.get_value();
-    _force_io_getevents_syscall = opts.force_aio_syscalls.get_value();
-    aio_nowait_supported = opts.linux_aio_nowait.get_value();
-    _have_aio_fsync = opts.aio_fsync.get_value();
 }
 
 pollable_fd
@@ -1789,18 +1706,6 @@ reactor::reap_kernel_completions() {
     return _backend->reap_kernel_completions();
 }
 
-#if SEASTAR_API_LEVEL < 7
-const io_priority_class& default_priority_class() {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    static thread_local auto shard_default_class = [] {
-        return io_priority_class::register_one("default", 1);
-    }();
-    return shard_default_class;
-#pragma GCC diagnostic pop
-}
-#endif
-
 namespace internal {
 
 size_t sanitize_iovecs(std::vector<iovec>& iov, size_t disk_alignment) noexcept {
@@ -1826,11 +1731,11 @@ future<file>
 reactor::open_file_dma(std::string_view nameref, open_flags flags, file_open_options options) noexcept {
     return do_with(static_cast<int>(flags), std::move(options), [this, nameref] (auto& open_flags, file_open_options& options) {
         sstring name(nameref);
-        return _thread_pool->submit<syscall_result_extra<struct stat>>([this, name, &open_flags, &options, strict_o_direct = _strict_o_direct, bypass_fsync = _bypass_fsync] () mutable {
+        return _thread_pool->submit<syscall_result_extra<struct stat>>([this, name, &open_flags, &options, strict_o_direct = _cfg.strict_o_direct, bypass_fsync = _cfg.bypass_fsync] () mutable {
             // We want O_DIRECT, except in three cases:
             //   - tmpfs (which doesn't support it, but works fine anyway)
             //   - strict_o_direct == false (where we forgive it being not supported)
-            //   - _kernel_page_cache == true (where we disable it for short-lived test processes)
+            //   - kernel_page_cache == true (where we disable it for short-lived test processes)
             // Because open() with O_DIRECT will fail, we open it without O_DIRECT, try
             // to update it to O_DIRECT with fcntl(), and if that fails, see if we
             // can forgive it.
@@ -1853,7 +1758,7 @@ reactor::open_file_dma(std::string_view nameref, open_flags flags, file_open_opt
                 return wrap_syscall(fd, st);
             }
             auto close_fd = defer([fd] () noexcept { ::close(fd); });
-            int o_direct_flag = _kernel_page_cache ? 0 : O_DIRECT;
+            int o_direct_flag = _cfg.kernel_page_cache ? 0 : O_DIRECT;
             int r = ::fcntl(fd, F_SETFL, open_flags | o_direct_flag);
             if (r == -1  && strict_o_direct) {
                 auto maybe_ret = wrap_syscall(r, st);  // capture errno (should be EINVAL)
@@ -1861,7 +1766,7 @@ reactor::open_file_dma(std::string_view nameref, open_flags flags, file_open_opt
                     return maybe_ret;
                 }
             }
-            if (fd != -1 && options.extent_allocation_size_hint && !_kernel_page_cache) {
+            if (fd != -1 && options.extent_allocation_size_hint && !_cfg.kernel_page_cache) {
                 fsxattr attr = {};
                 int r = ::ioctl(fd, XFS_IOC_FSGETXATTR, &attr);
                 // xfs delayed allocation is disabled when extent size hints are present.
@@ -2218,6 +2123,47 @@ void reactor::kill(pid_t pid, int sig) {
     ret.throw_if_error();
 }
 
+future<std::optional<struct group_details>> reactor::getgrnam(std::string_view name) {
+    syscall_result_extra<std::optional<struct group_details>> sr = co_await _thread_pool->submit<syscall_result_extra<std::optional<struct group_details>>>(
+        [name = sstring(name)] {
+            struct group grp;
+            struct group *result;
+            memset(&grp, 0, sizeof(struct group));
+            char buf[1024];
+            errno = 0;
+            int ret = ::getgrnam_r(name.c_str(), &grp, buf, sizeof(buf), &result);
+            if (!result) {
+                return wrap_syscall(ret, std::optional<struct group_details>(std::nullopt));
+            }
+
+            group_details gd;
+            gd.group_name = sstring(grp.gr_name);
+            gd.group_passwd = sstring(grp.gr_passwd);
+            gd.group_id = grp.gr_gid;
+            for (char **members = grp.gr_mem; *members != nullptr; ++members) {
+                gd.group_members.emplace_back(sstring(*members));
+            }
+            return wrap_syscall(ret, std::optional<struct group_details>(gd));
+        });
+
+    if (sr.result != 0) {
+        throw std::system_error(sr.ec());
+    }
+
+    co_return sr.extra;
+}
+
+future<> reactor::chown(std::string_view filepath, uid_t owner, gid_t group) {
+    syscall_result<int> sr = co_await _thread_pool->submit<syscall_result<int>>(
+        [filepath = sstring(filepath), owner, group] {
+            int ret = ::chown(filepath.c_str(), owner, group);
+            return wrap_syscall(ret);
+        });
+
+    sr.throw_if_error();
+    co_return;
+}
+
 future<stat_data>
 reactor::file_stat(std::string_view pathname, follow_symlink follow) noexcept {
     // Allocating memory for a sstring can throw, hence the futurize_invoke
@@ -2394,10 +2340,10 @@ reactor::touch_directory(std::string_view name, file_permissions permissions) no
 future<>
 reactor::fdatasync(int fd) noexcept {
     ++_fsyncs;
-    if (_bypass_fsync) {
+    if (_cfg.bypass_fsync) {
         return make_ready_future<>();
     }
-    if (_have_aio_fsync) {
+    if (_cfg.have_aio_fsync) {
         // Does not go through the I/O queue, but has to be deleted
         struct fsync_io_desc final : public io_completion {
             promise<> _pr;
@@ -2435,7 +2381,6 @@ reactor::fdatasync(int fd) noexcept {
 
 // Note: terminate if arm_highres_timer throws
 // `when` should always be valid
-#ifndef HAVE_OSV
 void reactor::enable_timer(steady_clock_type::time_point when) noexcept
 {
     itimerspec its;
@@ -2443,16 +2388,7 @@ void reactor::enable_timer(steady_clock_type::time_point when) noexcept
     its.it_value = to_timespec(when);
     _backend->arm_highres_timer(its);
 }
-#else
-void reactor::enable_timer(steady_clock_type::time_point when) noexcept
-{
-    using ns = std::chrono::nanoseconds;
-    WITH_LOCK(_timer_mutex) {
-        _timer_due = std::chrono::duration_cast<ns>(when.time_since_epoch()).count();
-        _timer_cond.wake_one();
-    }
-}
-#endif
+
 
 void reactor::add_timer(timer<steady_clock_type>* tmr) noexcept {
     if (queue_timer(tmr)) {
@@ -2657,7 +2593,7 @@ void reactor::run_tasks(task_queue& tq) {
         ++_global_tasks_processed;
         // check at end of loop, to allow at least one task to run
         if (internal::scheduler_need_preempt()) {
-            if (tasks.size() <= _max_task_backlog) {
+            if (tasks.size() <= _cfg.max_task_backlog) {
                 break;
             } else {
                 // While need_preempt() is set, task execution is inefficient due to
@@ -2744,8 +2680,6 @@ reactor::do_check_lowres_timers() const noexcept {
     return lowres_clock::now() > _lowres_next_timeout;
 }
 
-#ifndef HAVE_OSV
-
 class reactor::kernel_submit_work_pollfn final : public simple_pollfn<true> {
     reactor& _r;
 public:
@@ -2754,8 +2688,6 @@ public:
         return _r._backend->kernel_submit_work();
     }
 };
-
-#endif
 
 class reactor::signal_pollfn final : public reactor::pollfn {
     reactor& _r;
@@ -2985,7 +2917,8 @@ reactor::wakeup() {
     _sleeping.store(false, std::memory_order_relaxed);
 
     uint64_t one = 1;
-    ::write(_notify_eventfd.get(), &one, sizeof(one));
+    auto res = ::write(_notify_eventfd.get(), &one, sizeof(one));
+    assert(res == sizeof(one) && "write(2) failed on _reactor._notify_eventfd");
 }
 
 void reactor::start_aio_eventfd_loop() {
@@ -2995,7 +2928,7 @@ void reactor::start_aio_eventfd_loop() {
     future<> loop_done = repeat([this] {
         return _aio_eventfd->readable().then([this] {
             char garbage[8];
-            ::read(_aio_eventfd->get_fd(), garbage, 8); // totally uninteresting
+            std::ignore = ::read(_aio_eventfd->get_fd(), garbage, 8); // totally uninteresting
             return _stopping ? stop_iteration::yes : stop_iteration::no;
         });
     });
@@ -3010,7 +2943,8 @@ void reactor::stop_aio_eventfd_loop() {
         return;
     }
     uint64_t one = 1;
-    ::write(_aio_eventfd->get_fd(), &one, 8);
+    auto res = ::write(_aio_eventfd->get_fd(), &one, 8);
+    assert(res == 8 && "write(2) failed on _reactor._aio_eventfd");
 }
 
 inline
@@ -3221,7 +3155,7 @@ int reactor::do_run() {
     start_aio_eventfd_loop();
 
     if (_id == 0 && _cfg.auto_handle_sigint_sigterm) {
-       if (_handle_sigint) {
+       if (_cfg.handle_sigint) {
           _signals.handle_signal_once(SIGINT, [this] { stop(); });
        }
        _signals.handle_signal_once(SIGTERM, [this] { stop(); });
@@ -3269,7 +3203,7 @@ int reactor::do_run() {
     });
     load_timer.arm_periodic(1s);
 
-    itimerspec its = seastar::posix::to_relative_itimerspec(_task_quota, _task_quota);
+    itimerspec its = seastar::posix::to_relative_itimerspec(_cfg.task_quota, _cfg.task_quota);
     _task_quota_timer.timerfd_settime(0, its);
     auto& task_quote_itimerspec = its;
 
@@ -3334,7 +3268,7 @@ int reactor::do_run() {
             }
             if (go_to_sleep) {
                 internal::cpu_relax();
-                if (idle_end - idle_start > _max_poll_time) {
+                if (idle_end - idle_start > _cfg.max_poll_time) {
                     // Turn off the task quota timer to avoid spurious wakeups
                     struct itimerspec zero_itimerspec = {};
                     _task_quota_timer.timerfd_settime(0, zero_itimerspec);
@@ -3831,6 +3765,7 @@ reactor_options::reactor_options(program_options::option_group* parent_group)
     , task_quota_ms(*this, "task-quota-ms", 0.5, "Max time (ms) between polls")
     , io_latency_goal_ms(*this, "io-latency-goal-ms", {}, "Max time (ms) io operations must take (1.5 * task-quota-ms if not set)")
     , io_flow_ratio_threshold(*this, "io-flow-rate-threshold", 1.1, "Dispatch rate to completion rate threshold")
+    , io_completion_notify_ms(*this, "io-completion-notify-ms", {}, "Threshold in milliseconds over which IO request completion is reported to logs")
     , max_task_backlog(*this, "max-task-backlog", 1000, "Maximum number of task backlog to allow; above this we ignore I/O")
     , blocked_reactor_notify_ms(*this, "blocked-reactor-notify-ms", 25, "threshold in miliseconds over which the reactor is considered blocked if no progress is made")
     , blocked_reactor_reports_per_minute(*this, "blocked-reactor-reports-per-minute", 5, "Maximum number of backtraces reported by stall detector per minute")
@@ -4011,8 +3946,8 @@ void install_oneshot_signal_handler() {
         std::lock_guard<util::spinlock> g(lock);
         if (!handled) {
             handled = true;
-            Func();
             signal(sig, SIG_DFL);
+            Func();
         }
     };
     sigfillset(&sa.sa_mask);
@@ -4064,6 +3999,7 @@ private:
     unsigned _num_io_groups = 0;
     std::unordered_map<dev_t, mountpoint_params> _mountpoints;
     std::chrono::duration<double> _latency_goal;
+    std::chrono::milliseconds _stall_threshold;
     double _flow_ratio_backpressure_threshold;
 
 public:
@@ -4081,6 +4017,10 @@ public:
         return _latency_goal;
     }
 
+    std::chrono::milliseconds stall_threshold() const {
+        return _stall_threshold;
+    }
+
     double latency_goal_opt(const reactor_options& opts) const {
         return opts.io_latency_goal_ms ?
                 opts.io_latency_goal_ms.get_value() :
@@ -4093,6 +4033,7 @@ public:
         seastar_logger.debug("latency_goal: {}", latency_goal().count());
         _flow_ratio_backpressure_threshold = reactor_opts.io_flow_ratio_threshold.get_value();
         seastar_logger.debug("flow-ratio threshold: {}", _flow_ratio_backpressure_threshold);
+        _stall_threshold = reactor_opts.io_completion_notify_ms.defaulted() ? std::chrono::milliseconds::max() : reactor_opts.io_completion_notify_ms.get_value() * 1ms;
 
         if (smp_opts.num_io_groups) {
             _num_io_groups = smp_opts.num_io_groups.get_value();
@@ -4188,6 +4129,7 @@ public:
         // scheduler will self-tune to allow for the single 64k request, while it would
         // be better to sacrifice some IO latency, but allow for larger concurrency
         cfg.block_count_limit_min = (64 << 10) >> io_queue::block_size_shift;
+        cfg.stall_threshold = stall_threshold();
 
         return cfg;
     }
@@ -4196,6 +4138,28 @@ public:
         return boost::adaptors::keys(_mountpoints);
     }
 };
+
+void smp::log_aiocbs(log_level level, unsigned storage, unsigned preempt, unsigned network) {
+    // Each cell in the table should be
+    // - as wide as the grand total,
+    // - as wide as its containing column's header,
+    // whichever is wider.
+    std::string percpu_hdr = format("per cpu");
+    std::string allcpus_hdr = format("all {} cpus", smp::count);
+    unsigned percpu_total = storage + preempt + network;
+    unsigned allcpus_total = percpu_total * smp::count;
+    size_t num_width = format("{}", allcpus_total).length();
+    size_t percpu_width = std::max(num_width, percpu_hdr.length());
+    size_t allcpus_width = std::max(num_width, allcpus_hdr.length());
+
+    seastar_logger.log(level, "purpose  {:{}}  {:{}}",     percpu_hdr,   percpu_width, allcpus_hdr,          allcpus_width);
+    seastar_logger.log(level, "-------  {:-<{}}  {:-<{}}", "",           percpu_width, "",                   allcpus_width);
+    seastar_logger.log(level, "storage  {:{}}  {:{}}",     storage,      percpu_width, storage * smp::count, allcpus_width);
+    seastar_logger.log(level, "preempt  {:{}}  {:{}}",     preempt,      percpu_width, preempt * smp::count, allcpus_width);
+    seastar_logger.log(level, "network  {:{}}  {:{}}",     network,      percpu_width, network * smp::count, allcpus_width);
+    seastar_logger.log(level, "-------  {:-<{}}  {:-<{}}", "",           percpu_width, "",                   allcpus_width);
+    seastar_logger.log(level, "total    {:{}}  {:{}}",     percpu_total, percpu_width, allcpus_total,        allcpus_width);
+}
 
 unsigned smp::adjust_max_networking_aio_io_control_blocks(unsigned network_iocbs)
 {
@@ -4208,15 +4172,39 @@ unsigned smp::adjust_max_networking_aio_io_control_blocks(unsigned network_iocbs
     auto requested_aio_network = network_iocbs * smp::count;
     auto requested_aio_other = (storage_iocbs + preempt_iocbs) * smp::count;
     auto requested_aio = requested_aio_network + requested_aio_other;
-    auto network_iocbs_old = network_iocbs;
+
+    seastar_logger.debug("Intended AIO control block usage:");
+    seastar_logger.debug("");
+    log_aiocbs(log_level::debug, storage_iocbs, preempt_iocbs, network_iocbs);
+    seastar_logger.debug("");
+    seastar_logger.debug("Available AIO control blocks = aio-max-nr - aio-nr = {} - {} = {}", aio_max_nr, aio_nr, available_aio);
 
     if (available_aio < requested_aio) {
-        seastar_logger.warn("Requested AIO slots too large, please increase request capacity in /proc/sys/fs/aio-max-nr. configured:{} available:{} requested:{}", aio_max_nr, available_aio, requested_aio);
         if (available_aio >= requested_aio_other + smp::count) { // at least one queue for each shard
             network_iocbs = (available_aio - requested_aio_other) / smp::count;
-            seastar_logger.warn("max-networking-io-control-blocks adjusted from {} to {}, since AIO slots are unavailable", network_iocbs_old, network_iocbs);
+            seastar_logger.warn("Your system does not have enough AIO capacity for optimal network performance; reducing `max-networking-io-control-blocks'.");
+            seastar_logger.warn("Resultant AIO control block usage:");
+            seastar_logger.warn("");
+            log_aiocbs(log_level::warn, storage_iocbs, preempt_iocbs, network_iocbs);
+            seastar_logger.warn("");
+            seastar_logger.warn("For optimal network performance, set /proc/sys/fs/aio-max-nr to at least {}.", aio_nr + requested_aio);
         } else {
-            throw std::runtime_error("Could not setup Async I/O: Not enough request capacity in /proc/sys/fs/aio-max-nr. Try increasing that number or reducing the amount of logical CPUs available for your application");
+            std::string err = format("Your system does not satisfy minimum AIO requirements. "
+                                     "Set /proc/sys/fs/aio-max-nr to at least {} (minimum) or {} (recommended for networking performance)",
+                                     aio_nr + (requested_aio_other + smp::count), aio_nr + requested_aio);
+
+            unsigned smp_count_max = available_aio / (storage_iocbs + preempt_iocbs + 1);
+            if (smp_count_max > 0) {
+                err.append(format(", or decrease the logical CPU count of the application to {} (maximum)", smp_count_max));
+
+                unsigned smp_count_recommended = available_aio / (storage_iocbs + preempt_iocbs + network_iocbs);
+                if (smp_count_recommended > 0) {
+                    err.append(format(" or {} (recommended for networking performance)", smp_count_recommended));
+                }
+            }
+
+            err.append(".");
+            throw std::runtime_error(err);
         }
     }
 
@@ -4397,10 +4385,36 @@ void smp::configure(const smp_options& smp_opts, const reactor_options& reactor_
         memory::set_dump_memory_diagnostics_on_alloc_failure_kind(reactor_opts.dump_memory_diagnostics_on_alloc_failure_kind.get_value());
     }
 
-    reactor_config reactor_cfg;
-    reactor_cfg.auto_handle_sigint_sigterm = reactor_opts._auto_handle_sigint_sigterm;
-    reactor_cfg.max_networking_aio_io_control_blocks = adjust_max_networking_aio_io_control_blocks(reactor_opts.max_networking_io_control_blocks.get_value());
+    auto max_networking_aio_io_control_blocks = reactor_opts.max_networking_io_control_blocks.get_value();
+    // Prevent errors about insufficient AIO blocks, when they are not needed by the reactor backend.
+    if (reactor_opts.reactor_backend.get_selected_candidate().name() == "linux-aio") {
+        max_networking_aio_io_control_blocks = adjust_max_networking_aio_io_control_blocks(max_networking_aio_io_control_blocks);
+    }
 
+    reactor_config reactor_cfg = {
+        .task_quota = std::chrono::duration_cast<sched_clock::duration>(reactor_opts.task_quota_ms.get_value() * 1ms),
+        .max_poll_time = [&reactor_opts] () -> std::chrono::nanoseconds {
+            if (reactor_opts.poll_mode) {
+                return std::chrono::nanoseconds::max();
+            } else if (reactor_opts.overprovisioned && reactor_opts.idle_poll_time_us.defaulted()) {
+                return 0us;
+            } else {
+                return reactor_opts.idle_poll_time_us.get_value() * 1us;
+            }
+        }(),
+        .handle_sigint = !reactor_opts.no_handle_interrupt,
+        .auto_handle_sigint_sigterm = reactor_opts._auto_handle_sigint_sigterm,
+        .max_networking_aio_io_control_blocks = max_networking_aio_io_control_blocks,
+        .force_io_getevents_syscall = reactor_opts.force_aio_syscalls.get_value(),
+        .kernel_page_cache = reactor_opts.kernel_page_cache.get_value(),
+        .have_aio_fsync = reactor_opts.aio_fsync.get_value(),
+        .max_task_backlog = reactor_opts.max_task_backlog.get_value(),
+        .strict_o_direct = !reactor_opts.relaxed_dma,
+        .bypass_fsync = reactor_opts.unsafe_bypass_fsync.get_value(),
+        .no_poll_aio = !reactor_opts.poll_aio.get_value() || (reactor_opts.poll_aio.defaulted() && reactor_opts.overprovisioned),
+    };
+
+    aio_nowait_supported = reactor_opts.linux_aio_nowait.get_value();
     std::mutex mtx;
 
 #ifdef SEASTAR_HEAPPROF
@@ -4970,16 +4984,12 @@ float scheduling_group::get_shares() const noexcept {
 void
 scheduling_group::set_shares(float shares) noexcept {
     engine()._task_queues[_id]->set_shares(shares);
-#if SEASTAR_API_LEVEL >= 7
     engine().update_shares_for_queues(internal::priority_class(*this), shares);
-#endif
 }
 
-#if SEASTAR_API_LEVEL >= 7
 future<> scheduling_group::update_io_bandwidth(uint64_t bandwidth) const {
     return engine().update_bandwidth_for_queues(internal::priority_class(*this), bandwidth);
 }
-#endif
 
 future<scheduling_group>
 create_scheduling_group(sstring name, sstring shortname, float shares) noexcept {
@@ -5012,13 +5022,6 @@ scheduling_group_key_create(scheduling_group_key_config cfg) noexcept {
     });
 }
 
-#if SEASTAR_API_LEVEL < 7
-future<>
-rename_priority_class(io_priority_class pc, sstring new_name) {
-    return pc.rename(std::move(new_name));
-}
-#endif
-
 future<>
 destroy_scheduling_group(scheduling_group sg) noexcept {
     if (sg == default_scheduling_group()) {
@@ -5046,9 +5049,7 @@ rename_scheduling_group(scheduling_group sg, sstring new_name, sstring new_short
     }
     return smp::invoke_on_all([sg, new_name, new_shortname] {
         engine()._task_queues[sg._id]->rename(new_name, new_shortname);
-#if SEASTAR_API_LEVEL >= 7
         engine().rename_queues(internal::priority_class(sg), new_name);
-#endif
         return engine().rename_scheduling_group_specific_data(sg);
     });
 }

@@ -27,6 +27,7 @@
 #include <seastar/rpc/lz4_compressor.hh>
 #include <seastar/rpc/lz4_fragmented_compressor.hh>
 #include <seastar/rpc/multi_algo_compressor_factory.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/testing/test_runner.hh>
@@ -40,6 +41,8 @@
 #include <seastar/util/closeable.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/util/later.hh>
+
+#include <boost/range/numeric.hpp>
 
 #include <span>
 

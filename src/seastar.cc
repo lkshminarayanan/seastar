@@ -44,6 +44,7 @@ module;
 // put all headers not provided by this module into the global module fragment
 // to prevent attachment to the module
 
+#include <any>
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -75,6 +76,7 @@ module;
 #include <optional>
 #include <queue>
 #include <random>
+#include <ranges>
 #include <regex>
 #include <source_location>
 #include <sstream>
@@ -116,6 +118,7 @@ module;
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#include <fmt/ranges.h>
 #include <fmt/printf.h>
 #include <gnutls/crypto.h>
 #ifdef SEASTAR_HAVE_HWLOC
@@ -233,6 +236,7 @@ export module seastar;
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/shared_ptr_debug_helper.hh>
 #include <seastar/core/shared_ptr_incomplete.hh>
+#include <seastar/core/signal.hh>
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>

@@ -34,10 +34,10 @@
 #ifndef SEASTAR_MODULE
 #include <boost/lockfree/spsc_queue.hpp>
 #include <boost/thread/barrier.hpp>
-#include <boost/range/irange.hpp>
 #include <deque>
 #include <optional>
 #include <thread>
+#include <ranges>
 #endif
 
 /// \file
@@ -395,8 +395,8 @@ public:
     }
     static bool poll_queues();
     static bool pure_poll_queues();
-    static boost::integer_range<unsigned> all_cpus() noexcept {
-        return boost::irange(0u, count);
+    static std::ranges::range auto all_cpus() noexcept {
+        return std::views::iota(0u, count);
     }
     /// Invokes func on all shards.
     ///
@@ -479,6 +479,7 @@ private:
     void allocate_reactor(unsigned id, reactor_backend_selector rbs, reactor_config cfg);
     void create_thread(std::function<void ()> thread_loop);
     unsigned adjust_max_networking_aio_io_control_blocks(unsigned network_iocbs);
+    static void log_aiocbs(log_level level, unsigned storage, unsigned preempt, unsigned network);
 public:
     static unsigned count;
 };

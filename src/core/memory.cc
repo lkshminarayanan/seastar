@@ -78,8 +78,8 @@ module;
 #include <unordered_set>
 #include <iostream>
 #include <optional>
-#include <thread>
 #include <memory_resource>
+#include <thread>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -1865,9 +1865,9 @@ configure(std::vector<resource::memory> m, bool mbind,
         get_cpu_mem().replace_memory_backing(sys_alloc);
     }
     get_cpu_mem().resize(total, sys_alloc);
+#ifdef SEASTAR_HAVE_NUMA
     size_t pos = 0;
     for (auto&& x : m) {
-#ifdef SEASTAR_HAVE_NUMA
         unsigned long nodemask = 1UL << x.nodeid;
         if (mbind) {
             auto start = get_cpu_mem().mem() + pos;
@@ -1888,9 +1888,9 @@ configure(std::vector<resource::memory> m, bool mbind,
             }
             ret_layout.ranges.push_back({.start = start, .end = start + x.bytes, .numa_node_id = x.nodeid});
         }
-#endif
         pos += x.bytes;
     }
+#endif
     return ret_layout;
 }
 
@@ -2022,11 +2022,7 @@ seastar::internal::log_buf::inserter_iterator do_dump_memory_diagnostics(seastar
 
     if (additional_diagnostics_producer) {
         additional_diagnostics_producer([&it] (std::string_view v) mutable {
-#if FMT_VERSION >= 80000
             it = fmt::format_to(it, fmt::runtime(v));
-#else
-            it = fmt::format_to(it, v);
-#endif
         });
     }
 

@@ -354,6 +354,9 @@ seastar_add_test (network_interface
 seastar_add_test (json_formatter
   SOURCES json_formatter_test.cc)
 
+seastar_add_test (libc_wrapper
+  SOURCES libc_wrapper_test.cc)
+
 seastar_add_test (locking
   SOURCES locking_test.cc)
 
@@ -457,6 +460,10 @@ seastar_add_test (source_location
 
 seastar_add_test (shared_token_bucket
   SOURCES shared_token_bucket_test.cc)
+
+seastar_add_test (prometheus_http
+  SOURCES
+    prometheus_http_test.cc)
 
 function(seastar_add_certgen name)
   cmake_parse_arguments(CERT

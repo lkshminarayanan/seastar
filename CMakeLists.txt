@@ -73,11 +73,11 @@ set (Seastar_API_LEVEL
   "7"
   CACHE
   STRING
-  "Seastar compatibility API level (5=future<T>::get() returns T&&, 6=future is not variadic, 7=unified CPU/IO scheduling groups")
+  "Seastar compatibility API level (7=unified CPU/IO scheduling groups")
 
 set_property (CACHE Seastar_API_LEVEL
   PROPERTY
-  STRINGS 6)
+  STRINGS 7)
 
 set (Seastar_SCHEDULING_GROUPS_COUNT
   "16"
@@ -582,6 +582,7 @@ add_library (seastar
   include/seastar/core/shared_ptr_debug_helper.hh
   include/seastar/core/shared_ptr_incomplete.hh
   include/seastar/core/simple-stream.hh
+  include/seastar/core/signal.hh
   include/seastar/core/slab.hh
   include/seastar/core/sleep.hh
   include/seastar/core/sstring.hh
@@ -715,6 +716,7 @@ add_library (seastar
   src/core/sharded.cc
   src/core/scollectd.cc
   src/core/scollectd-impl.hh
+  src/core/signal.cc
   src/core/systemwide_memory_barrier.cc
   src/core/smp.cc
   src/core/sstring.cc
@@ -778,6 +780,10 @@ add_library (seastar
   src/websocket/server.cc
   )
 
+# We disable _FORTIFY_SOURCE because it generates false positives with longjmp() (src/core/thread.cc)
+set_source_files_properties(src/core/thread.cc
+  PROPERTIES COMPILE_FLAGS -U_FORTIFY_SOURCE)
+
 add_library (Seastar::seastar ALIAS seastar)
 
 add_dependencies (seastar
@@ -796,6 +802,7 @@ target_include_directories (seastar
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 set (Seastar_PRIVATE_CXX_FLAGS
+  -fno-semantic-interposition
   -UNDEBUG
   -Wall
   -Werror
@@ -813,6 +820,14 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   list (APPEND Seastar_PRIVATE_CXX_FLAGS
     -Wdeprecated-declarations
     -Wno-error=deprecated-declarations)
+endif ()
+
+if (CMAKE_CXX_STANDARD GREATER_EQUAL 23)
+  include (CheckP2582R1)
+  if (Cxx_Compiler_IMPLEMENTS_P2581R1)
+    target_compile_definitions (seastar
+      PUBLIC SEASTAR_P2581R1)
+  endif ()
 endif ()
 
 if (BUILD_SHARED_LIBS)
@@ -877,7 +892,7 @@ if (condition)
   if (NOT Sanitizers_FOUND)
     message (FATAL_ERROR "Sanitizers not found!")
   endif ()
-  set (Seastar_Sanitizers_OPTIONS ${Sanitizers_COMPILER_OPTIONS})
+  set (Seastar_Sanitizers_OPTIONS ${Sanitizers_COMPILE_OPTIONS})
   target_link_libraries (seastar
     PUBLIC
       $<${condition}:Sanitizers::address>
@@ -898,12 +913,6 @@ include (CTest)
 #
 # To disable -Werror, pass -Wno-error to Seastar_CXX_FLAGS.
 #
-# We disable _FORTIFY_SOURCE because it generates false positives with longjmp() (src/core/thread.cc)
-#
-
-target_compile_options (seastar
-  PUBLIC
-    -U_FORTIFY_SOURCE)
 
 target_compile_definitions(seastar
   PUBLIC

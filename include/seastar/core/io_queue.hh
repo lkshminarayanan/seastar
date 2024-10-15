@@ -46,15 +46,6 @@ namespace internal {
 const fair_group& get_fair_group(const io_queue& ioq, unsigned stream);
 }
 
-#if SEASTAR_API_LEVEL < 7
-SEASTAR_MODULE_EXPORT
-class io_priority_class;
-
-[[deprecated("Use io_priority_class.rename")]]
-future<>
-rename_priority_class(io_priority_class pc, sstring new_name);
-#endif
-
 SEASTAR_MODULE_EXPORT
 class io_intent;
 
@@ -77,9 +68,6 @@ struct maybe_priority_class_ref;
 class priority_class {
     unsigned _id;
 public:
-#if SEASTAR_API_LEVEL < 7
-    explicit priority_class(const io_priority_class& pc) noexcept;
-#endif
     explicit priority_class(const scheduling_group& sg) noexcept;
     explicit priority_class(internal::maybe_priority_class_ref pc) noexcept;
     unsigned id() const noexcept { return _id; }
@@ -116,9 +104,14 @@ private:
     uint64_t _prev_dispatched = 0;
     uint64_t _prev_completed = 0;
     double _flow_ratio = 1.0;
-    timer<lowres_clock> _flow_ratio_update;
+
+    timer<lowres_clock> _averaging_decay_timer;
+
+    const std::chrono::milliseconds _stall_threshold_min;
+    std::chrono::milliseconds _stall_threshold;
 
     void update_flow_ratio() noexcept;
+    void lower_stall_threshold() noexcept;
 
     metrics::metric_groups _metric_groups;
 public:
@@ -148,9 +141,10 @@ public:
         bool duplex = false;
         std::chrono::duration<double> rate_limit_duration = std::chrono::milliseconds(1);
         size_t block_count_limit_min = 1;
-        unsigned flow_ratio_ticks = 100;
+        unsigned averaging_decay_ticks = 100;
         double flow_ratio_ema_factor = 0.95;
         double flow_ratio_backpressure_threshold = 1.1;
+        std::chrono::milliseconds stall_threshold = std::chrono::milliseconds(100);
     };
 
     io_queue(io_group_ptr group, internal::io_sink& sink);
@@ -166,7 +160,7 @@ public:
     void submit_request(io_desc_read_write* desc, internal::io_request req) noexcept;
     void cancel_request(queued_io_request& req) noexcept;
     void complete_cancelled_request(queued_io_request& req) noexcept;
-    void complete_request(io_desc_read_write& desc) noexcept;
+    void complete_request(io_desc_read_write& desc, std::chrono::duration<double> delay) noexcept;
 
     [[deprecated("I/O queue users should not track individual requests, but resources (weight, size) passing through the queue")]]
     size_t queued_requests() const {

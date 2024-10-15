@@ -125,7 +125,7 @@ macro (seastar_find_dependencies)
   seastar_set_dep_args (dpdk
     OPTION ${Seastar_DPDK})
   seastar_set_dep_args (fmt REQUIRED
-    VERSION 5.0.0)
+    VERSION 8.1.1)
   seastar_set_dep_args (lz4 REQUIRED
     VERSION 1.7.3)
   seastar_set_dep_args (GnuTLS REQUIRED
@@ -165,5 +165,12 @@ macro (seastar_find_dependencies)
     find_package(Protobuf CONFIG REQUIRED)
   else ()
     find_package(Protobuf 2.5.0 REQUIRED)
+  endif ()
+
+  if (c-ares_VERSION VERSION_GREATER_EQUAL 1.33)
+    # https://github.com/scylladb/seastar/issues/2472
+    message (FATAL_ERROR
+      "c-ares ${c-ares_VERSION} is not supported. "
+      "Seastar requires c-ares version lower than 1.33")
   endif ()
 endmacro ()

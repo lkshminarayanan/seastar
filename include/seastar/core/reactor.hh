@@ -30,6 +30,7 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/idle_cpu_handler.hh>
+#include <seastar/core/internal/io_desc.hh>
 #include <seastar/core/internal/io_request.hh>
 #include <seastar/core/internal/io_sink.hh>
 #include <seastar/core/iostream.hh>
@@ -46,7 +47,6 @@
 #include <seastar/core/scheduling_specific.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread_cputime_clock.hh>
@@ -55,16 +55,13 @@
 #include <seastar/net/api.hh>
 #include <seastar/util/eclipse.hh>
 #include <seastar/util/log.hh>
-#include <seastar/util/std-compat.hh>
 #include <seastar/util/modules.hh>
+#include <seastar/util/noncopyable_function.hh>
+#include <seastar/util/std-compat.hh>
 #include "internal/pollable_fd.hh"
 
 #ifndef SEASTAR_MODULE
 #include <boost/container/static_vector.hpp>
-#include <boost/lockfree/spsc_queue.hpp>
-#include <boost/next_prior.hpp>
-#include <boost/range/irange.hpp>
-#include <boost/thread/barrier.hpp>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -79,12 +76,6 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 
-#ifdef HAVE_OSV
-#include <osv/sched.hh>
-#include <osv/mutex.h>
-#include <osv/condvar.h>
-#include <osv/newpoll.hh>
-#endif
 #endif
 
 struct statfs;
@@ -139,7 +130,6 @@ void increase_thrown_exceptions_counter() noexcept;
 
 }
 
-class kernel_completion;
 class io_queue;
 SEASTAR_MODULE_EXPORT
 class io_intent;
@@ -222,16 +212,7 @@ private:
     reactor_config _cfg;
     file_desc _notify_eventfd;
     file_desc _task_quota_timer;
-#ifdef HAVE_OSV
-    reactor_backend_osv _backend;
-    sched::thread _timer_thread;
-    sched::thread *_engine_thread;
-    mutable mutex _timer_mutex;
-    condvar _timer_cond;
-    s64 _timer_due = 0;
-#else
     std::unique_ptr<reactor_backend> _backend;
-#endif
     sigset_t _active_sigmask; // holds sigmask while sleeping with sig disabled
     std::vector<pollfn*> _pollers;
 
@@ -251,7 +232,6 @@ private:
     bool _stopped = false;
     bool _finished_running_tasks = false;
     condition_variable _stop_requested;
-    bool _handle_sigint = true;
     std::optional<future<std::unique_ptr<network_stack>>> _network_stack_ready;
     int _return = 0;
     promise<> _start_promise;
@@ -262,7 +242,6 @@ private:
     metrics::internal::time_estimated_histogram _stalls_histogram;
     std::unique_ptr<internal::cpu_stall_detector> _cpu_stall_detector;
 
-    unsigned _max_task_backlog = 1000;
     timer<>::set_t _timers;
     timer<>::set_t::timer_list_t _expired_timers;
     timer<lowres_clock>::set_t _lowres_timers;
@@ -307,11 +286,10 @@ private:
     task_queue_list _active_task_queues;
     task_queue_list _activating_task_queues;
     task_queue* _at_destroy_tasks;
-    sched_clock::duration _task_quota;
     task* _current_task = nullptr;
     /// Handler that will be called when there is no task to execute on cpu.
     /// It represents a low priority work.
-    /// 
+    ///
     /// Handler's return value determines whether handler did any actual work. If no work was done then reactor will go
     /// into sleep.
     ///
@@ -327,15 +305,9 @@ private:
     sched_clock::duration _total_idle{0};
     sched_clock::duration _total_sleep;
     sched_clock::time_point _start_time = now();
-    std::chrono::nanoseconds _max_poll_time = calculate_poll_time();
     output_stream<char>::batch_flush_list_t _flush_batching;
     std::atomic<bool> _sleeping alignas(seastar::cache_line_size){0};
     pthread_t _thread_id alignas(seastar::cache_line_size) = pthread_self();
-    bool _strict_o_direct = true;
-    bool _force_io_getevents_syscall = false;
-    bool _bypass_fsync = false;
-    bool _have_aio_fsync = false;
-    bool _kernel_page_cache = false;
     std::atomic<bool> _dying{false};
     gate _background_gate;
 
@@ -363,10 +335,13 @@ private:
     bool pure_poll_once();
 public:
     /// Register a user-defined signal handler
+    [[deprecated("Use seastar::handle_signal(signo, handler, once); instead")]]
     void handle_signal(int signo, noncopyable_function<void ()>&& handler);
     void wakeup();
     /// @private
     bool stopped() const noexcept { return _stopped; }
+    /// @private
+    uint64_t polls() const noexcept { return _polls; }
 
 private:
     class signals {
@@ -394,6 +369,8 @@ private:
     friend class thread_pool;
     friend class thread_context;
     friend class internal::cpu_stall_detector;
+
+    friend void handle_signal(int signo, noncopyable_function<void ()>&& handler, bool once);
 
     uint64_t pending_task_count() const;
     void run_tasks(task_queue& tq);
@@ -437,6 +414,7 @@ private:
     future<temporary_buffer<char>>
     do_recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba);
 
+    void configure(const reactor_options& opts);
     int do_run();
 public:
     explicit reactor(std::shared_ptr<smp> smp, alien::instance& alien, unsigned id, reactor_backend_selector rbs, reactor_config cfg);
@@ -460,25 +438,12 @@ public:
         }
     }
 
-#if SEASTAR_API_LEVEL < 7
-    [[deprecated("Use io_priority_class::register_one")]]
-    io_priority_class register_one_priority_class(sstring name, uint32_t shares);
-
-    [[deprecated("Use io_priority_class.update_shares")]]
-    future<> update_shares_for_class(io_priority_class pc, uint32_t shares);
-
-    [[deprecated("Use io_priority_class.rename")]]
-    static future<> rename_priority_class(io_priority_class pc, sstring new_name) noexcept;
-#endif
-
     /// @private
     future<> update_bandwidth_for_queues(internal::priority_class pc, uint64_t bandwidth);
     /// @private
     void rename_queues(internal::priority_class pc, sstring new_name);
     /// @private
     void update_shares_for_queues(internal::priority_class pc, uint32_t shares);
-
-    void configure(const reactor_options& opts);
 
     server_socket listen(socket_address sa, listen_options opts = {});
 
@@ -501,6 +466,8 @@ public:
     future<> touch_directory(std::string_view name, file_permissions permissions = file_permissions::default_dir_permissions) noexcept;
     future<std::optional<directory_entry_type>>  file_type(std::string_view name, follow_symlink = follow_symlink::yes) noexcept;
     future<stat_data> file_stat(std::string_view pathname, follow_symlink) noexcept;
+    future<> chown(std::string_view filepath, uid_t owner, gid_t group);
+    future<std::optional<struct group_details>> getgrnam(std::string_view name);
     future<uint64_t> file_size(std::string_view pathname) noexcept;
     future<bool> file_accessible(std::string_view pathname, access_flags flags) noexcept;
     future<bool> file_exists(std::string_view pathname) noexcept {
@@ -564,7 +531,7 @@ public:
 
     /// Set a handler that will be called when there is no task to execute on cpu.
     /// Handler should do a low priority work.
-    /// 
+    ///
     /// Handler's return value determines whether handler did any actual work. If no work was done then reactor will go
     /// into sleep.
     ///
@@ -596,10 +563,6 @@ public:
     /// \return An object containing a snapshot of the statistics at this point in time.
     sched_stats get_sched_stats() const;
     uint64_t abandoned_failed_futures() const { return _abandoned_failed_futures; }
-#ifdef HAVE_OSV
-    void timer_thread_func();
-    void set_timer(sched::timer &tmr, s64 t);
-#endif
 private:
     /**
      * Add a new "poller" - a non-blocking function returning a boolean, that

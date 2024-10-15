@@ -32,17 +32,6 @@
 #include <sstream>
 #endif
 
-#if 0
-inline
-std::ostream&
-operator<<(std::ostream& os, const void* ptr) {
-    auto flags = os.flags();
-    os << "0x" << std::hex << reinterpret_cast<uintptr_t>(ptr);
-    os.flags(flags);
-    return os;
-}
-#endif
-
 SEASTAR_MODULE_EXPORT
 inline
 std::ostream&
@@ -140,13 +129,9 @@ log(A&&... a) {
  */
 template <typename... A>
 sstring
-format(const char* fmt, A&&... a) {
+format(fmt::format_string<A...> fmt, A&&... a) {
     fmt::memory_buffer out;
-#if FMT_VERSION >= 80000
-    fmt::format_to(fmt::appender(out), fmt::runtime(fmt), std::forward<A>(a)...);
-#else
-    fmt::format_to(out, fmt, std::forward<A>(a)...);
-#endif
+    fmt::format_to(fmt::appender(out), fmt, std::forward<A>(a)...);
     return sstring{out.data(), out.size()};
 }
 
