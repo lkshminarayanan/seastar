@@ -36,12 +36,8 @@ include(CMakeParseArguments)
 # - Boost::foo
 set (Boost_NO_BOOST_CMAKE ON)
 
-if (CMAKE_CXX_STANDARD LESS 20)
-  set (_seastar_boost_version 1.64.0)
-else ()
-  # for including the fix of https://github.com/boostorg/test/pull/252
-  set (_seastar_boost_version 1.73.0)
-endif ()
+# for including the fix of https://github.com/boostorg/test/pull/252
+set (_seastar_boost_version 1.73.0)
 
 # This is the minimum version of Boost we need the CMake-bundled `FindBoost.cmake` to know about.
 find_package (Boost ${_seastar_boost_version} MODULE)
@@ -167,10 +163,10 @@ macro (seastar_find_dependencies)
     find_package(Protobuf 2.5.0 REQUIRED)
   endif ()
 
-  if (c-ares_VERSION VERSION_GREATER_EQUAL 1.33)
+  if (c-ares_VERSION VERSION_GREATER_EQUAL 1.33.0 AND c-ares_VERSION VERSION_LESS 1.34.1)
     # https://github.com/scylladb/seastar/issues/2472
     message (FATAL_ERROR
       "c-ares ${c-ares_VERSION} is not supported. "
-      "Seastar requires c-ares version lower than 1.33")
+      "Seastar requires c-ares version <1.33 or >=1.34.1 ")
   endif ()
 endmacro ()
